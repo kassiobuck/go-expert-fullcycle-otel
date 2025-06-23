@@ -1,0 +1,12 @@
+
+### valid cep
+POST http://localhost:8080/cep?cep=01153000
+Content-Type: application/json
+
+### invalid cep
+POST http://localhost:8080/cep?cep=550
+Content-Type: application/json
+
+### invalid cep
+POST http://localhost:8080/cep?cep=A29118530
+Content-Type: application/json

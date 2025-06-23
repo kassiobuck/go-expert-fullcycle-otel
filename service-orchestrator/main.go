@@ -3,176 +3,145 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
+	"strings"
 	"time"
 
+	"github.com/kassiobuck/go-expert-fullcycle-otel/otel/otel_provider"
+	appServer "github.com/kassiobuck/go-expert-fullcycle-otel/server"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/zipkin"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
-	"go.opentelemetry.io/otel/trace"
 )
 
-// Response structure
-type TempResponse struct {
-	City  string  `json:"city"`
-	TempC float64 `json:"temp_C"`
-	TempF float64 `json:"temp_F"`
-	TempK float64 `json:"temp_K"`
-}
+var serviceBName = "service_b"
+var weatherApiKey = "a8b08e25d1d04de988935939250506"
 
-// ViaCEP response structure
-type ViaCEPResponse struct {
-	Localidade string `json:"localidade"`
-	Erro       bool   `json:"erro,omitempty"`
-}
+func main() {
 
-// Validate CEP: must be 8 digits
-func validateCEP(cep string) bool {
-	re := regexp.MustCompile(`^\d{8}$`)
-	return re.MatchString(cep)
-}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
 
-// Service A: Busca CEP
-func buscaCEP(ctx context.Context, tracer trace.Tracer, cep string) (string, error) {
-	ctx, span := tracer.Start(ctx, "buscaCEP")
-	defer span.End()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
-	url := fmt.Sprintf("https://viacep.com.br/ws/%s/json/", cep)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := http.DefaultClient.Do(req)
+	shutdown, err := otel_provider.InitProvider(serviceBName)
 	if err != nil {
-		return "", err
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := shutdown(ctx); err != nil {
+			log.Fatal("failed to shutdown TracerProvider: %w", err)
+		}
+	}()
+
+	otel_provider.InitProvider(serviceBName)
+
+	sr := appServer.NewServer(serviceBName, otel.Tracer(serviceBName))
+	routes := sr.CreateServer([]appServer.Route{
+		{Path: "/clima", Handler: tempGetHandler},
+	})
+
+	http.ListenAndServe(":8081", routes)
+
+	select {
+	case <-sigCh:
+		log.Println("Shutting down gracefully, CTRL+C pressed...")
+	case <-ctx.Done():
+		log.Println("Shutting down due to other reason...")
+	}
+
+	// Create a timeout context for the graceful shutdown
+	_, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+}
+
+func tempGetHandler(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	cep := r.URL.Query().Get("cep")
+	if len(cep) != 8 {
+		http.Error(w, "invalid zipcode", http.StatusUnprocessableEntity)
+		return
+	}
+
+	viacepURL := fmt.Sprintf("https://viacep.com.br/ws/%s/json/", cep)
+	resp, err := http.Get(viacepURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		http.Error(w, "can not find zipcode", http.StatusUnprocessableEntity)
+		return
 	}
 	defer resp.Body.Close()
 
-	var data ViaCEPResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return "", err
+	var viacepResp struct {
+		Localidade string `json:"localidade"`
 	}
-	if data.Erro {
-		return "", errors.New("not found")
-	}
-	return data.Localidade, nil
-}
 
-// Service B: Busca Temperatura
-func buscaTemperatura(ctx context.Context, tracer trace.Tracer, city string) (float64, error) {
-	ctx, span := tracer.Start(ctx, "buscaTemperatura")
-	defer span.End()
+	err = json.NewDecoder(resp.Body).Decode(&viacepResp)
 
-	apiKey := os.Getenv("WEATHERAPI_KEY")
-	if apiKey == "" {
-		return 0, errors.New("WEATHERAPI_KEY not set")
+	if err != nil || viacepResp.Localidade == "" {
+		http.Error(w, "can not find zipcode", http.StatusNotFound)
+		return
 	}
-	url := fmt.Sprintf("https://api.weatherapi.com/v1/current.json?key=%s&q=%s", apiKey, city)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := http.DefaultClient.Do(req)
+
+	city := normalize(viacepResp.Localidade)
+
+	weatherURL := fmt.Sprintf("http://api.weatherapi.com/v1/current.json?key=%s&q=%s", weatherApiKey, city)
+	wresp, err := http.Get(weatherURL)
 	if err != nil {
-		return 0, err
+		http.Error(w, "error fetching weather", http.StatusInternalServerError)
+		return
 	}
-	defer resp.Body.Close()
+	defer wresp.Body.Close()
 
-	var result struct {
+	var weatherResp struct {
 		Current struct {
 			TempC float64 `json:"temp_c"`
 		} `json:"current"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, err
+	if err := json.NewDecoder(wresp.Body).Decode(&weatherResp); err != nil {
+		http.Error(w, "error parsing weather data", http.StatusInternalServerError)
+		return
 	}
-	return result.Current.TempC, nil
+
+	tempC := weatherResp.Current.TempC
+	tempF := tempC*1.8 + 32
+	tempK := tempC + 273
+
+	response := struct {
+		City  string  `json:"city"`
+		TempC float64 `json:"tempC"`
+		TempF float64 `json:"tempF"`
+		TempK float64 `json:"tempK"`
+	}{
+		City:  viacepResp.Localidade,
+		TempC: tempC,
+		TempF: tempF,
+		TempK: tempK,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
-// Convert Celsius to Fahrenheit
-func celsiusToFahrenheit(celsius float64) float64 {
-	f := celsius*1.8 + 32
-	return math.Round(f*10) / 10
-}
-
-// Convert Celsius to Kelvin
-func celsiusToKelvin(celsius float64) float64 {
-	k := celsius + 273.15
-	return math.Round(k*10) / 10
-}
-
-// OTEL setup
-func initTracer() (func(context.Context) error, error) {
-	zipkinURL := "http://localhost:9411/api/v2/spans"
-	exporter, err := zipkin.New(zipkinURL)
-	if err != nil {
-		return nil, err
+// Remove acentos e substitui ç por c
+func normalize(s string) string {
+	s = strings.ToLower(s)
+	s = regexp.MustCompile(`\s+`).ReplaceAllString(s, "+")
+	replacements := []struct {
+		old string
+		new string
+	}{
+		{"á", "a"}, {"à", "a"}, {"ã", "a"}, {"â", "a"}, {"ä", "a"},
+		{"é", "e"}, {"è", "e"}, {"ê", "e"}, {"ë", "e"},
+		{"í", "i"}, {"ì", "i"}, {"î", "i"}, {"ï", "i"},
+		{"ó", "o"}, {"ò", "o"}, {"õ", "o"}, {"ô", "o"}, {"ö", "o"},
+		{"ú", "u"}, {"ù", "u"}, {"û", "u"}, {"ü", "u"},
+		{"ç", "c"},
 	}
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("service-orchestrator"),
-		)),
-	)
-	otel.SetTracerProvider(tp)
-	return tp.Shutdown, nil
-}
-
-func main() {
-	shutdown, err := initTracer()
-	if err != nil {
-		log.Fatalf("failed to initialize tracer: %v", err)
+	for _, r := range replacements {
+		s = strings.ReplaceAll(s, r.old, r.new)
 	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		defer cancel()
-		_ = shutdown(ctx)
-	}()
-
-	tracer := otel.Tracer("service-orchestrator")
-
-	http.HandleFunc("/temperature", func(w http.ResponseWriter, r *http.Request) {
-		ctx, span := tracer.Start(r.Context(), "request")
-		defer span.End()
-
-		cep := r.URL.Query().Get("cep")
-		if !validateCEP(cep) {
-			http.Error(w, "invalid zipcode", http.StatusUnprocessableEntity)
-			return
-		}
-
-		city, err := buscaCEP(ctx, tracer, cep)
-		if err != nil {
-			http.Error(w, "can not find zipcode", http.StatusNotFound)
-			return
-		}
-
-		tempC, err := buscaTemperatura(ctx, tracer, city)
-		if err != nil {
-			http.Error(w, "can not find temperature", http.StatusInternalServerError)
-			return
-		}
-
-		tempF := celsiusToFahrenheit(tempC)
-		tempK := celsiusToKelvin(tempC)
-
-		resp := TempResponse{
-			City:  city,
-			TempC: tempC,
-			TempF: tempF,
-			TempK: tempK,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	log.Printf("Listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	return s
 }
