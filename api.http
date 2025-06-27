@@ -1,12 +1,46 @@
 
-### valid cep
-POST http://localhost:8080/cep?cep=01153000
+### valid cep:
+POST http://localhost:8080/cep
 Content-Type: application/json
 
-### invalid cep
-POST http://localhost:8080/cep?cep=550
+{
+    "cep":"29118500"
+}
+
+### invalid cep: format
+POST http://localhost:8080/cep
 Content-Type: application/json
 
-### invalid cep
-POST http://localhost:8080/cep?cep=A29118530
+{
+    "cep":"AIZ9118O"
+}
+
+### invalid cep: long length
+POST http://localhost:8080/cep
 Content-Type: application/json
+
+{
+    "cep":"1029118530"
+}
+
+### invalid cep: short length
+POST http://localhost:8080/cep
+Content-Type: application/json
+
+{
+    "cep":"0102910"
+}
+
+### valid cep: not found
+POST http://localhost:8080/cep
+Content-Type: application/json
+
+{
+    "cep":"00158000"
+}
+
+### orchestrator valid cep
+GET http://localhost:8081/clima?cep=29118500
+
+### valid cep: not found
+GET http://localhost:8081/clima?cep=12345678

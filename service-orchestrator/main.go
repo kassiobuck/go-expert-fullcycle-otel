@@ -14,21 +14,32 @@ import (
 
 	"github.com/kassiobuck/go-expert-fullcycle-otel/otel/otel_provider"
 	appServer "github.com/kassiobuck/go-expert-fullcycle-otel/server"
+	"github.com/spf13/viper"
 	"go.opentelemetry.io/otel"
 )
 
-var serviceBName = "service_b"
-var weatherApiKey = "a8b08e25d1d04de988935939250506"
+func init() {
+	env := os.Getenv("APP_ENV")
+	if env == "" {
+		env = "dev"
+	}
+	viper.SetConfigFile("./env/service-orchestrator." + env + ".env")
+	err := viper.ReadInConfig()
+	if err != nil {
+		log.Println("fatal error config file: %w", err)
+	}
+}
 
 func main() {
-
+	serviceName := viper.GetString("SERVICE_NAME")
+	otelUrl := viper.GetString("OTEL_URL")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Kill, os.Interrupt)
 	defer cancel()
 
-	shutdown, err := otel_provider.InitProvider(serviceBName)
+	shutdown, err := otel_provider.InitProvider(serviceName, otelUrl)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,9 +49,7 @@ func main() {
 		}
 	}()
 
-	otel_provider.InitProvider(serviceBName)
-
-	sr := appServer.NewServer(serviceBName, otel.Tracer(serviceBName))
+	sr := appServer.NewServer(serviceName, otel.Tracer(serviceName))
 	routes := sr.CreateServer([]appServer.Route{
 		{Path: "/clima", Handler: tempGetHandler},
 	})
@@ -60,6 +69,7 @@ func main() {
 }
 
 func tempGetHandler(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	weatherApiKey := viper.GetString("WEATHER_API_KEY")
 	cep := r.URL.Query().Get("cep")
 	if len(cep) != 8 {
 		http.Error(w, "invalid zipcode", http.StatusUnprocessableEntity)
@@ -69,19 +79,20 @@ func tempGetHandler(ctx context.Context, w http.ResponseWriter, r *http.Request)
 	viacepURL := fmt.Sprintf("https://viacep.com.br/ws/%s/json/", cep)
 	resp, err := http.Get(viacepURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		http.Error(w, "can not find zipcode", http.StatusUnprocessableEntity)
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
 
 	var viacepResp struct {
 		Localidade string `json:"localidade"`
+		Erro       bool   `json:"erro"`
 	}
 
 	err = json.NewDecoder(resp.Body).Decode(&viacepResp)
 
-	if err != nil || viacepResp.Localidade == "" {
-		http.Error(w, "can not find zipcode", http.StatusNotFound)
+	if err != nil || viacepResp.Erro {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 

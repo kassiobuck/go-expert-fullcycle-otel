@@ -15,9 +15,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func InitProvider(serviceName string) (func(context.Context) error, error) {
+func InitProvider(serviceName string, otelService string) (func(context.Context) error, error) {
 
-	//otel.SetTextMapPropagator(p)
 	ctx := context.Background()
 
 	res, err := resource.New(ctx,
@@ -31,7 +30,7 @@ func InitProvider(serviceName string) (func(context.Context) error, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	conn, err := grpc.NewClient("otel-collector:4317",
+	conn, err := grpc.NewClient(otelService,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
@@ -52,14 +51,6 @@ func InitProvider(serviceName string) (func(context.Context) error, error) {
 		trace.WithSpanProcessor(bsp),
 	)
 	otel.SetTracerProvider(tracerProvider)
-
-	// propagator := propagation.NewCompositeTextMapPropagator(
-	// 	propagation.TraceContext{},
-	// 	propagation.Baggage{},
-	// 	b3.New(b3.WithInjectEncoding(b3.B3MultipleHeader)),
-	// )
-	// otel.SetTextMapPropagator(propagator)
-
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	return tracerProvider.Shutdown, nil
