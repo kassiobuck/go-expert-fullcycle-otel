@@ -25,7 +25,7 @@ Acessar a pasta  service-input e executar o comando:
 #### OTEL
 Execute o comando: 
 ```shell
-    docker run -d -p 4317:4317 otel/opentelemetry-collector:0.128.0`
+    docker run -d -p 4317:4317 otel/opentelemetry-collector:0.128.0
 ```
 *Otel está configurado como coletor para integrar com zipkin, Zipkin disponível apenas no modo de produção*
 
